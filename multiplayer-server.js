@@ -33,8 +33,7 @@ const AFK_TIMEOUT_SEC = 120;
 const AFK_TIMEOUT_MS = AFK_TIMEOUT_SEC * 1000;
 const AFK_RESET_COOLDOWN_MS = 10_000;
 function perPlayerMsForMode(_mode) {
-  // keep 5 minutes fixed as requested
-  return 5 * 60 * 1000;
+  return 5 * 60 * 1000; // fixed 5 min
 }
 function queueKey(mode, betAmount) {
   return mode === "paid" ? `paid_${Number(betAmount) || 0}` : "free";
@@ -58,21 +57,19 @@ function createRoomState(room, gameId, mode, betAmount, whiteUid, blackUid) {
     betAmount,
     isFinished: false,
     gameOver: false,
-    winner: null, // "white" | "black" | null
+    winner: null,
     chess: new Chess(),
     whiteUid,
     blackUid,
-    // chess clock
     whiteTime: per,
     blackTime: per,
     currentTurn: "white",
     turnClockStartedAt: now,
-    // active socket ownership by side (prevents stale-socket races)
+    // current authoritative socket per player color
     playerSockets: {
       white: null,
       black: null,
     },
-    // AFK state
     afk: {
       active: false,
       player: null, // "white" | "black" | null
@@ -111,11 +108,12 @@ function liveClockPayloadFromState(st) {
 }
 function emitClockEvents(st) {
   const live = liveClockPayloadFromState(st);
+  // required timer event
   io.to(st.room).emit("timerUpdate", {
     whiteTime: live.whiteTime,
     blackTime: live.blackTime,
   });
-  // compatibility with existing frontend
+  // keep compatibility
   io.to(st.room).emit("clockSync", live);
   io.to(st.room).emit("gameState", live);
 }
@@ -143,13 +141,13 @@ function startAfkCountdown(room, playerColor) {
   if (isFinalized(st)) return;
   if (playerColor !== "white" && playerColor !== "black") return;
   const now = Date.now();
-  // if already AFK with same owner: do not reset timer
+  // Already AFK same player -> don't reset
   if (st.afk.active && st.afk.player === playerColor) {
     const remainingSec = Math.ceil((st.afk.deadlineAt - now) / 1000);
     emitPlayerAfk(st, remainingSec);
     return;
   }
-  // if AFK currently owned by other side: do not flip owner
+  // AFK already owned by opposite side -> don't flip owner
   if (st.afk.active && st.afk.player && st.afk.player !== playerColor) {
     return;
   }
@@ -183,7 +181,7 @@ function clearAfkCountdown(room, playerColor) {
 }
 function endMatch(room, payload) {
   const st = roomStates.get(room);
-  if (isFinalized(st)) return; // prevent duplicate emits / double settle
+  if (isFinalized(st)) return; // prevent duplicate emits/races
   st.isFinished = true;
   st.gameOver = true;
   st.winner = payload.winnerColor ?? null;
@@ -222,26 +220,26 @@ function handleChessTimeout(room, loserColor) {
   });
 }
 function handleAfkAbandon(room, afkPlayerColor) {
-  const afkPlayer = { color: afkPlayerColor };
-  const opponentColor = oppositeColor(afkPlayer.color);
-  // requested debug logs
-  console.log("AFK PLAYER:", afkPlayer.color);
-  console.log("WINNER SHOULD BE:", opponentColor);
+  const loserColor = afkPlayerColor;
+  const winnerColor = oppositeColor(loserColor);
+  // requested logs
+  console.log("AFK PLAYER:", loserColor);
+  console.log("WINNER SHOULD BE:", winnerColor);
   const reasonText =
-    afkPlayer.color === "white"
+    loserColor === "white"
       ? "White abandoned the game"
       : "Black abandoned the game";
   console.log("[AFK] timeout reached", {
     room,
-    loser: afkPlayer.color,
-    winner: opponentColor,
+    loser: loserColor,
+    winner: winnerColor,
     reason: reasonText,
   });
   endMatch(room, {
     reason: "afk_abandon",
     gameOverReason: reasonText,
-    winnerColor: opponentColor, // critical: opponent wins
-    loserColor: afkPlayer.color,
+    winnerColor, // AFK player loses
+    loserColor,
     draw: false,
   });
 }
@@ -255,7 +253,7 @@ function tickActiveGames() {
   const now = Date.now();
   for (const [room, st] of roomStates.entries()) {
     if (isFinalized(st)) continue;
-    // 1) AFK resolution MUST happen before chess timeout logic
+    // 1) AFK RESOLUTION PRIORITY
     if (st.afk.active && st.afk.player) {
       const remainingMs = st.afk.deadlineAt - now;
       const remainingSec = Math.max(0, Math.ceil(remainingMs / 1000));
@@ -268,11 +266,11 @@ function tickActiveGames() {
         handleAfkAbandon(room, st.afk.player);
         continue;
       }
-      // keep clocks syncing, but skip chess timeout resolution while AFK active
+      // keep client clocks syncing, but skip chess timeout checks during AFK
       emitClockEvents(st);
       continue;
     }
-    // 2) normal chess timer logic
+    // 2) CHESS CLOCK LOGIC
     applyElapsedToActiveClock(st, now);
     if (st.whiteTime <= 0) {
       handleChessTimeout(room, "white");
@@ -299,11 +297,12 @@ io.on("connection", (socket) => {
     const key = queueKey(mode, betAmount);
     if (!waitingQueues.has(key)) waitingQueues.set(key, []);
     const queue = waitingQueues.get(key);
-    // remove stale queue entries
+    // remove stale entries
     for (let i = queue.length - 1; i >= 0; i--) {
       const e = queue[i];
       if (!e?.socket?.connected) queue.splice(i, 1);
     }
+    // find valid opponent
     let first = null;
     while (queue.length > 0) {
       const candidate = queue.shift();
@@ -393,8 +392,9 @@ io.on("connection", (socket) => {
       mode: st.mode,
       playerId: uid,
     };
-    // transfer ownership to this latest socket
+    // transfer ownership to latest socket
     st.playerSockets[color] = socket.id;
+    // valid return before timeout
     clearAfkCountdown(room, color);
     socket.emit("rejoinOk", {
       room,
@@ -472,9 +472,10 @@ io.on("connection", (socket) => {
     if (isFinalized(st)) return;
     const mover = playerColorFromSocketMeta(socket.matchMeta);
     if (!mover || mover !== st.currentTurn) return;
-    if (st.playerSockets[mover] !== socket.id) return; // stale socket guard
+    if (st.playerSockets[mover] !== socket.id) return;
+    // apply elapsed before checking timeout
     applyElapsedToActiveClock(st, Date.now());
-    // chess timeout checks only when AFK is inactive
+    // chess timeout checks only when AFK inactive
     if (!st.afk.active) {
       if (st.whiteTime <= 0) {
         handleChessTimeout(room, "white");
@@ -558,7 +559,7 @@ io.on("connection", (socket) => {
     });
   });
   socket.on("disconnect", () => {
-    // remove from queue
+    // queue cleanup
     const key = socket.waitingQueueKey;
     if (key && waitingQueues.has(key)) {
       const q = waitingQueues.get(key);
@@ -566,18 +567,18 @@ io.on("connection", (socket) => {
       if (idx >= 0) q.splice(idx, 1);
       if (q.length === 0) waitingQueues.delete(key);
     }
-    // AFK start only if disconnected socket is current owner
+    // AFK start only if this socket is current owner
     const meta = socket.matchMeta;
     if (!meta?.room || (meta.color !== "white" && meta.color !== "black")) return;
     const st = roomStates.get(meta.room);
     if (isFinalized(st)) return;
     const color = meta.color;
-    const isCurrentOwner = st.playerSockets[color] === socket.id;
-    if (!isCurrentOwner) return; // stale disconnect ignored
+    if (st.playerSockets[color] !== socket.id) return; // stale disconnect ignored
     st.playerSockets[color] = null;
     startAfkCountdown(meta.room, color);
   });
 });
+/** single global ticker */
 let activeTicker = null;
 function startTicker() {
   if (activeTicker) return;
