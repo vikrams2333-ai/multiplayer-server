@@ -25,8 +25,9 @@ const io = new Server(server, {
 const waitingQueues = new Map();
 /** room -> game state */
 const roomStates = new Map();
-function perPlayerMsForMode(mode) {
-  return mode === "paid" ? 5 * 60 * 1000 : 10 * 60 * 1000;
+/** Force 5 min for every mode */
+function perPlayerMsForMode(_mode) {
+  return 5 * 60 * 1000;
 }
 function queueKey(mode, betAmount) {
   return mode === "paid" ? `paid_${Number(betAmount) || 0}` : "free";
@@ -45,11 +46,10 @@ function createRoomState(room, gameId, mode, betAmount, whiteUid, blackUid) {
     // Required fields
     whiteTime: per,
     blackTime: per,
-    currentTurn: "white",
-    winner: null,
+    currentTurn: "white", // "white" | "black"
+    winner: null, // "white" | "black" | null
     gameOver: false,
     // Internal timing state
-    turnStartedAt: now,
     lastTickAt: now,
     // Safety / cleanup
     isFinished: false,
@@ -58,14 +58,36 @@ function createRoomState(room, gameId, mode, betAmount, whiteUid, blackUid) {
   roomStates.set(room, st);
   return st;
 }
-function toClockPayload(st) {
+function toTimerPayload(st) {
   return {
     whiteTime: Math.max(0, st.whiteTime),
     blackTime: Math.max(0, st.blackTime),
   };
 }
-function emitTimerUpdate(st) {
-  io.to(st.room).emit("timerUpdate", toClockPayload(st));
+/** Backward-compatible rich payload used by your existing frontend listeners */
+function toLiveClockPayload(st) {
+  const clock = toTimerPayload(st);
+  return {
+    room: st.room,
+    gameId: st.gameId,
+    whiteRemainingMs: clock.whiteTime,
+    blackRemainingMs: clock.blackTime,
+    whiteTime: clock.whiteTime,
+    blackTime: clock.blackTime,
+    currentTurn: st.currentTurn,
+    sideToMove: st.currentTurn === "white" ? "w" : "b",
+    serverNow: Date.now(),
+  };
+}
+/** Emit all clock events needed now */
+function emitClockEvents(st) {
+  const timer = toTimerPayload(st);
+  const live = toLiveClockPayload(st);
+  // New required event
+  io.to(st.room).emit("timerUpdate", timer);
+  // Existing events your frontend currently consumes
+  io.to(st.room).emit("clockSync", live);
+  io.to(st.room).emit("gameState", live);
 }
 function clearDisconnectGrace(st) {
   if (st.disconnectTimeoutId) {
@@ -84,14 +106,11 @@ function finalizeGame(room, { winner = null, reason = "game ended", draw = false
   if (!st || st.gameOver || st.isFinished) return;
   st.gameOver = true;
   st.isFinished = true;
-  st.winner = winner; // "white" | "black" | null
+  st.winner = winner;
   clearDisconnectGrace(st);
-  // Required event payload
-  io.to(room).emit("gameOver", {
-    winner: st.winner,
-    reason,
-  });
-  // Keep compatibility with your existing clients
+  // Required timeout/game end event
+  io.to(room).emit("gameOver", { winner: st.winner, reason });
+  // Keep compatibility with your current app
   io.to(room).emit("gameResult", {
     room: st.room,
     gameId: st.gameId,
@@ -108,7 +127,6 @@ function finalizeGame(room, { winner = null, reason = "game ended", draw = false
   cleanupRoom(room);
 }
 function handleTimeout(room, loserColor) {
-  // loserColor: "white" | "black"
   if (loserColor === "white") {
     finalizeGame(room, {
       winner: "black",
@@ -124,9 +142,9 @@ function handleTimeout(room, loserColor) {
   }
 }
 /**
- * Tick all active games once/sec:
- * - only currentTurn player's clock decreases
- * - emits timerUpdate every second
+ * Tick active games once/sec:
+ * - only current player's clock decreases
+ * - emits timer update events
  * - auto gameOver on timeout
  */
 function tickActiveGames() {
@@ -135,7 +153,7 @@ function tickActiveGames() {
     if (!st || st.gameOver || st.isFinished) continue;
     const elapsed = now - st.lastTickAt;
     if (elapsed < 1000) continue;
-    const steps = Math.floor(elapsed / 1000); // catch-up if server lagged
+    const steps = Math.floor(elapsed / 1000);
     st.lastTickAt += steps * 1000;
     if (st.currentTurn === "white") {
       st.whiteTime = Math.max(0, st.whiteTime - steps * 1000);
@@ -150,7 +168,7 @@ function tickActiveGames() {
         continue;
       }
     }
-    emitTimerUpdate(st);
+    emitClockEvents(st);
   }
 }
 function playerColorFromSocketMeta(meta) {
@@ -177,8 +195,10 @@ function startDisconnectGrace(room, disconnectedColor) {
 io.on("connection", (socket) => {
   socket.on("joinGame", (payload = {}) => {
     const mode = payload.mode === "paid" ? "paid" : "free";
-    const betAmount = mode === "paid" ? Math.max(0, Math.floor(Number(payload.betAmount) || 0)) : 0;
-    const uid = typeof payload.uid === "string" && payload.uid.length > 0 ? payload.uid : socket.id;
+    const betAmount =
+      mode === "paid" ? Math.max(0, Math.floor(Number(payload.betAmount) || 0)) : 0;
+    const uid =
+      typeof payload.uid === "string" && payload.uid.length > 0 ? payload.uid : socket.id;
     if (mode === "paid" && betAmount <= 0) {
       socket.emit("matchmaking_error", { message: "Invalid stake for paid match." });
       return;
@@ -205,8 +225,22 @@ io.on("connection", (socket) => {
     socket.join(room);
     first.socket.room = room;
     socket.room = room;
-    first.socket.matchMeta = { room, color: "white", gameId, mode, betAmount, playerId: whiteUid };
-    socket.matchMeta = { room, color: "black", gameId, mode, betAmount, playerId: blackUid };
+    first.socket.matchMeta = {
+      room,
+      color: "white",
+      gameId,
+      mode,
+      betAmount,
+      playerId: whiteUid,
+    };
+    socket.matchMeta = {
+      room,
+      color: "black",
+      gameId,
+      mode,
+      betAmount,
+      playerId: blackUid,
+    };
     const st = createRoomState(room, gameId, mode, betAmount, whiteUid, blackUid);
     const startPayload = (color) => ({
       room,
@@ -217,13 +251,13 @@ io.on("connection", (socket) => {
       whiteUid,
       blackUid,
       currentTurn: st.currentTurn,
-      clock: toClockPayload(st),
+      clock: toLiveClockPayload(st),
       gameOver: st.gameOver,
       winner: st.winner,
     });
     first.socket.emit("start", startPayload("white"));
     socket.emit("start", startPayload("black"));
-    emitTimerUpdate(st);
+    emitClockEvents(st);
   });
   socket.on("rejoinMatch", (payload = {}) => {
     const room = typeof payload.room === "string" ? payload.room : "";
@@ -264,11 +298,11 @@ io.on("connection", (socket) => {
       fen: st.chess.fen(),
       moves: st.chess.history(),
       currentTurn: st.currentTurn,
-      clock: toClockPayload(st),
+      clock: toLiveClockPayload(st),
       gameOver: st.gameOver,
       winner: st.winner,
     });
-    emitTimerUpdate(st);
+    emitClockEvents(st);
   });
   socket.on("move", (data = {}) => {
     const room = typeof data.room === "string" ? data.room : "";
@@ -283,27 +317,17 @@ io.on("connection", (socket) => {
       promotion: data.move.promotion || "q",
     });
     if (!moveTry) return;
-    // Turn switch (clock ticking is handled by global timer)
     st.currentTurn = st.currentTurn === "white" ? "black" : "white";
-    st.turnStartedAt = Date.now();
     io.to(room).emit("move", data.move);
-    emitTimerUpdate(st);
+    emitClockEvents(st);
     if (st.chess.isCheckmate()) {
       const loser = st.chess.turn() === "w" ? "white" : "black";
       const winner = loser === "white" ? "black" : "white";
-      finalizeGame(room, {
-        winner,
-        reason: "Checkmate",
-        draw: false,
-      });
+      finalizeGame(room, { winner, reason: "Checkmate", draw: false });
       return;
     }
     if (st.chess.isDraw()) {
-      finalizeGame(room, {
-        winner: null,
-        reason: "Draw",
-        draw: true,
-      });
+      finalizeGame(room, { winner: null, reason: "Draw", draw: true });
     }
   });
   socket.on("playerResigned", () => {
@@ -327,7 +351,6 @@ io.on("connection", (socket) => {
     });
   });
   socket.on("disconnect", () => {
-    // Remove from matchmaking queue
     const key = socket.waitingQueueKey;
     if (key && waitingQueues.has(key)) {
       const q = waitingQueues.get(key);
@@ -335,7 +358,6 @@ io.on("connection", (socket) => {
       if (idx >= 0) q.splice(idx, 1);
       if (q.length === 0) waitingQueues.delete(key);
     }
-    // Start disconnect grace if player was in active room
     const meta = socket.matchMeta;
     if (meta?.room && meta?.color) {
       const st = roomStates.get(meta.room);
@@ -345,7 +367,7 @@ io.on("connection", (socket) => {
     }
   });
 });
-/** Single global interval prevents duplicate room intervals */
+/** single global interval (no duplicate intervals) */
 let activeTicker = null;
 function startTicker() {
   if (activeTicker) return;
