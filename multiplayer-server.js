@@ -674,8 +674,51 @@ io.on("connection", (socket) => {
     io.to(room).emit("clockSync", liveRejoin);
     io.to(room).emit("gameState", liveRejoin);
   });
+  socket.on("appBackgrounded", (payload = {}) => {
+    const room = typeof payload.room === "string" ? payload.room : "";
+    const player =
+      payload.player === "white" || payload.player === "black"
+        ? payload.player
+        : null;
+    if (!room || !player || !socket.matchMeta) {
+      return;
+    }
+    if (socket.matchMeta.room !== room || socket.matchMeta.color !== player) {
+      return;
+    }
+    const st = roomStates.get(room);
+    if (!st || st.isFinished) {
+      return;
+    }
+    // Start/restart reconnect grace and AFK countdown for opponent
+    startDisconnectGrace(room, player);
+  });
+  socket.on("appForegrounded", (payload = {}) => {
+    const room = typeof payload.room === "string" ? payload.room : "";
+    const player =
+      payload.player === "white" || payload.player === "black"
+        ? payload.player
+        : null;
+    if (!room || !player || !socket.matchMeta) {
+      return;
+    }
+    if (socket.matchMeta.room !== room || socket.matchMeta.color !== player) {
+      return;
+    }
+    const st = roomStates.get(room);
+    if (!st || st.isFinished) {
+      return;
+    }
+    const returnedFromAway = st.disconnectingColor === player;
+    clearDisconnectGrace(st);
+    if (returnedFromAway) {
+      io.to(room).emit("playerReturned", { player });
+    }
+  });
   socket.on("move", (data = {}) => {
-    if (!data?.move) return;
+    if (!data?.move) {
+      return;
+    }
     const room = typeof data.room === "string" ? data.room : "";
     if (!room || socket.room !== room || !socket.matchMeta) return;
     const st = roomStates.get(room);
