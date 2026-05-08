@@ -1,9 +1,17 @@
+/**
+ * Chess realtime server — run on Hostinger VPS (or any Node host).
+ * MongoDB optional: connect from multiplayer-server.js (MONGODB_URI).
+ */
 const express = require("express");
 const http = require("http");
 const crypto = require("crypto");
 const { Chess } = require("chess.js");
 const { Server } = require("socket.io");
 const cors = require("cors");
+const mongoose = require("mongoose");
+const User = require("./models/User");
+const GameSettlement = require("./models/GameSettlement");
+
 const app = express();
 const corsOrigin = process.env.CORS_ORIGIN || "*";
 const adminApiKey = (process.env.ADMIN_API_KEY || "").trim();
@@ -20,6 +28,7 @@ app.get("/", (_req, res) => {
 app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "chess-socket" });
 });
+
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: corsOrigin === "*" ? true : corsOrigin.split(",").map((s) => s.trim()) },
@@ -27,32 +36,232 @@ const io = new Server(server, {
   pingTimeout: 25_000,
   pingInterval: 10_000,
 });
+
 /** @type {Map<string, { socket: import("socket.io").Socket, uid: string }>} */
 const firestoreMatchWaiters = new Map();
 /** @type {Map<string, Array<{ socket: import("socket.io").Socket, uid: string, mode: string, betAmount: number }>>} */
 const waitingQueues = new Map();
 /** @type {Map<string, any>} */
 const roomStates = new Map();
+
 const DEFAULT_SERVER_BALANCE = 1000;
 /** @type {Map<string, number>} */
 const serverBalancesByUid = new Map();
 /** @type {Map<string, Array<any>>} */
 const serverWalletLedgerByUid = new Map();
-/** Paid games that already updated the server ledger (idempotent). */
+/** Paid games that already updated the in-memory ledger (fallback when Mongo offline). */
 const serverWalletSettledGameIds = new Set();
+
+const K_RATING = 32;
+
 function perPlayerMsForMode(mode) {
   return mode === "paid" ? 5 * 60 * 1000 : 10 * 60 * 1000;
 }
+
 function normalizeUid(uid) {
   if (uid == null) return "";
   return String(uid).trim();
 }
+
+function mongoConnected() {
+  return mongoose.connection.readyState === 1;
+}
+
+function expectedScore(rA, rB) {
+  return 1 / (1 + Math.pow(10, (rB - rA) / 400));
+}
+
+async function snapshotBalancesFromMongo(whiteUid, blackUid) {
+  const w = normalizeUid(whiteUid);
+  const b = normalizeUid(blackUid);
+  const [wa, ba] = await Promise.all([
+    User.findOne({ username: w }).lean(),
+    User.findOne({ username: b }).lean(),
+  ]);
+  return {
+    [w]: Math.max(0, Math.floor(Number(wa?.wallet) || 0)),
+    [b]: Math.max(0, Math.floor(Number(ba?.wallet) || 0)),
+  };
+}
+
+function syncServerBalancesFromSnapshot(st, balancesByUid) {
+  const w = normalizeUid(st.whiteUid);
+  const b = normalizeUid(st.blackUid);
+  if (balancesByUid[w] !== undefined) serverBalancesByUid.set(w, balancesByUid[w]);
+  if (balancesByUid[b] !== undefined) serverBalancesByUid.set(b, balancesByUid[b]);
+}
+
+async function getOrCreateUser(uidRaw) {
+  const username = normalizeUid(uidRaw);
+  if (!username) throw new Error("invalid uid");
+  let doc = await User.findOne({ username });
+  if (!doc) {
+    doc = await User.create({
+      username,
+      wallet: 0,
+      rating: 1000,
+      wins: 0,
+      losses: 0,
+    });
+    console.log("[mongo] user created", username);
+  }
+  serverBalancesByUid.set(username, Math.max(0, Math.floor(Number(doc.wallet) || 0)));
+  return doc;
+}
+
+async function updateWallet(uidRaw, delta, meta = {}) {
+  const username = normalizeUid(uidRaw);
+  if (!username) return null;
+  const d = Math.floor(Number(delta) || 0);
+  const filter = d >= 0 ? { username } : { username, wallet: { $gte: -d } };
+  const updated = await User.findOneAndUpdate(filter, { $inc: { wallet: d } }, { new: true });
+  if (updated) {
+    serverBalancesByUid.set(username, Math.max(0, Math.floor(Number(updated.wallet) || 0)));
+    console.log("[mongo] wallet updated", username, updated.wallet, meta.reason || "");
+  }
+  return updated;
+}
+
+async function addWin(winnerUid, loserUid, session = null) {
+  const w = normalizeUid(winnerUid);
+  const l = normalizeUid(loserUid);
+  const opts = session ? { session } : {};
+  const wa = await User.findOne({ username: w }).session(session || null);
+  const la = await User.findOne({ username: l }).session(session || null);
+  if (!wa || !la) return;
+  const expW = expectedScore(wa.rating, la.rating);
+  const expL = expectedScore(la.rating, wa.rating);
+  const newWR = Math.round(wa.rating + K_RATING * (1 - expW));
+  const newLR = Math.round(la.rating + K_RATING * (0 - expL));
+  await User.updateOne(
+    { username: w },
+    { $inc: { wins: 1 }, $set: { rating: Math.max(100, newWR) } },
+    opts
+  );
+  await User.updateOne(
+    { username: l },
+    { $inc: { losses: 1 }, $set: { rating: Math.max(100, newLR) } },
+    opts
+  );
+}
+
+async function addLoss(loserUid, winnerUid, session = null) {
+  await addWin(winnerUid, loserUid, session);
+}
+
+async function deductEntryFeesBoth(whiteUid, blackUid, betAmount) {
+  const bet = Math.max(0, Math.floor(Number(betAmount) || 0));
+  if (bet <= 0) return true;
+  const w = normalizeUid(whiteUid);
+  const b = normalizeUid(blackUid);
+  const session = await mongoose.startSession();
+  session.startTransaction();
+  try {
+    const uw = await User.findOneAndUpdate(
+      { username: w, wallet: { $gte: bet } },
+      { $inc: { wallet: -bet } },
+      { new: true, session }
+    );
+    const ub = await User.findOneAndUpdate(
+      { username: b, wallet: { $gte: bet } },
+      { $inc: { wallet: -bet } },
+      { new: true, session }
+    );
+    if (!uw || !ub) {
+      await session.abortTransaction();
+      return false;
+    }
+    await session.commitTransaction();
+    serverBalancesByUid.set(w, Math.max(0, uw.wallet));
+    serverBalancesByUid.set(b, Math.max(0, ub.wallet));
+    console.log("[mongo] wallet updated", w, uw.wallet, "entry_deduct");
+    console.log("[mongo] wallet updated", b, ub.wallet, "entry_deduct");
+    return true;
+  } catch (err) {
+    await session.abortTransaction();
+    console.error("[mongo] deductEntryFeesBoth", err);
+    return false;
+  } finally {
+    session.endSession();
+  }
+}
+
+async function applyGameResultToMongo(st, payload) {
+  const gid = st.gameId;
+  const paidMatch = st.mode === "paid" && st.betAmount > 0;
+  const bet = Math.max(0, Math.floor(Number(st.betAmount) || 0));
+
+  const session = await mongoose.startSession();
+  try {
+    await session.withTransaction(async () => {
+      await GameSettlement.create([{ gameId: gid }], { session });
+
+      if (!paidMatch) {
+        if (!payload.draw && payload.winnerColor) {
+          const winnerUid = payload.winnerColor === "white" ? st.whiteUid : st.blackUid;
+          const loserUid = payload.winnerColor === "white" ? st.blackUid : st.whiteUid;
+          await addWin(winnerUid, loserUid, session);
+        }
+        return;
+      }
+
+      if (payload.draw) {
+        await User.updateOne(
+          { username: normalizeUid(st.whiteUid) },
+          { $inc: { wallet: bet } },
+          { session }
+        );
+        await User.updateOne(
+          { username: normalizeUid(st.blackUid) },
+          { $inc: { wallet: bet } },
+          { session }
+        );
+        return;
+      }
+
+      const winnerUid = payload.winnerColor === "white" ? st.whiteUid : st.blackUid;
+      const loserUid = payload.winnerColor === "white" ? st.blackUid : st.whiteUid;
+      const { winnerAmount } = calculateWinnerCreditServer(bet);
+      await User.updateOne(
+        { username: normalizeUid(winnerUid) },
+        { $inc: { wallet: winnerAmount } },
+        { session }
+      );
+      await addWin(winnerUid, loserUid, session);
+    });
+  } catch (err) {
+    if (err && err.code === 11000) {
+      const balancesByUid = await snapshotBalancesFromMongo(st.whiteUid, st.blackUid);
+      syncServerBalancesFromSnapshot(st, balancesByUid);
+      console.log("[match] duplicate settlement prevented", gid);
+      return { balancesByUid, paid: paidMatch, alreadySettled: true };
+    }
+    console.error("[match] applyGameResultToMongo", err);
+    throw err;
+  } finally {
+    session.endSession();
+  }
+
+  console.log("[match] ended", gid, payload.reason || "", !!payload.draw);
+  if (paidMatch && !payload.draw && payload.winnerColor) {
+    const betAmt = bet;
+    const { winnerAmount } = calculateWinnerCreditServer(betAmt);
+    const wUid = payload.winnerColor === "white" ? st.whiteUid : st.blackUid;
+    console.log("[match] payout completed", gid, normalizeUid(wUid), winnerAmount);
+  }
+
+  const balancesByUid = await snapshotBalancesFromMongo(st.whiteUid, st.blackUid);
+  syncServerBalancesFromSnapshot(st, balancesByUid);
+  return { balancesByUid, paid: paidMatch };
+}
+
 function getOrCreateLedger(uid) {
   if (!serverWalletLedgerByUid.has(uid)) {
     serverWalletLedgerByUid.set(uid, []);
   }
   return serverWalletLedgerByUid.get(uid);
 }
+
 function pushWalletLedger(uid, entry) {
   const rows = getOrCreateLedger(uid);
   rows.push({
@@ -65,6 +274,7 @@ function pushWalletLedger(uid, entry) {
     rows.splice(0, rows.length - 250);
   }
 }
+
 function getSrvBal(uidRaw) {
   const uid = normalizeUid(uidRaw);
   if (!uid) return DEFAULT_SERVER_BALANCE;
@@ -73,6 +283,7 @@ function getSrvBal(uidRaw) {
   }
   return serverBalancesByUid.get(uid);
 }
+
 function setSrvBal(uidRaw, nextBalance, meta = {}) {
   const uid = normalizeUid(uidRaw);
   if (!uid) return null;
@@ -93,6 +304,7 @@ function setSrvBal(uidRaw, nextBalance, meta = {}) {
   });
   return next;
 }
+
 function applySrvDelta(uidRaw, deltaRaw, meta = {}) {
   const uid = normalizeUid(uidRaw);
   if (!uid) return null;
@@ -114,11 +326,13 @@ function applySrvDelta(uidRaw, deltaRaw, meta = {}) {
   });
   return next;
 }
+
 function parseMoneyAmount(value) {
   const n = Math.floor(Number(value));
   if (!Number.isFinite(n) || n <= 0) return null;
   return n;
 }
+
 function isAdminRequestAuthorized(req) {
   if (!adminApiKey) return false;
   const header = req.get("x-admin-key");
@@ -130,6 +344,7 @@ function isAdminRequestAuthorized(req) {
   const token = auth.startsWith("Bearer ") ? auth.slice(7).trim() : "";
   return token === adminApiKey;
 }
+
 function requireAdmin(req, res, next) {
   if (!adminApiKey) {
     res.status(503).json({
@@ -144,12 +359,14 @@ function requireAdmin(req, res, next) {
   }
   next();
 }
+
 function calculateWinnerCreditServer(betPerPlayer) {
   const total = betPerPlayer * 2;
   const commission = Math.floor(total * 0.1);
   const winnerAmount = total - commission;
   return { total, commission, winnerAmount };
 }
+
 app.get("/admin/wallet/:uid", requireAdmin, (req, res) => {
   const uid = normalizeUid(req.params.uid);
   if (!uid) {
@@ -163,6 +380,7 @@ app.get("/admin/wallet/:uid", requireAdmin, (req, res) => {
     ledgerCount: getOrCreateLedger(uid).length,
   });
 });
+
 app.get("/admin/wallet/:uid/transactions", requireAdmin, (req, res) => {
   const uid = normalizeUid(req.params.uid);
   if (!uid) {
@@ -173,6 +391,7 @@ app.get("/admin/wallet/:uid/transactions", requireAdmin, (req, res) => {
   const rows = [...getOrCreateLedger(uid)].slice(-limit).reverse();
   res.json({ ok: true, uid, transactions: rows });
 });
+
 app.post("/admin/wallet/credit", requireAdmin, (req, res) => {
   const uid = normalizeUid(req.body?.uid);
   const amount = parseMoneyAmount(req.body?.amount);
@@ -189,6 +408,7 @@ app.post("/admin/wallet/credit", requireAdmin, (req, res) => {
   });
   res.json({ ok: true, uid, balance: next });
 });
+
 app.post("/admin/wallet/debit", requireAdmin, (req, res) => {
   const uid = normalizeUid(req.body?.uid);
   const amount = parseMoneyAmount(req.body?.amount);
@@ -205,6 +425,7 @@ app.post("/admin/wallet/debit", requireAdmin, (req, res) => {
   });
   res.json({ ok: true, uid, balance: next });
 });
+
 app.post("/admin/wallet/set", requireAdmin, (req, res) => {
   const uid = normalizeUid(req.body?.uid);
   const nextRaw = Math.floor(Number(req.body?.balance));
@@ -221,6 +442,8 @@ app.post("/admin/wallet/set", requireAdmin, (req, res) => {
   });
   res.json({ ok: true, uid, balance: next });
 });
+
+/** In-memory fallback when Mongo is offline (paid = settle at end from memory banks). */
 function buildBalancesForGameResult(st, payload) {
   const snapshot = () => ({
     [st.whiteUid]: getSrvBal(st.whiteUid),
@@ -294,10 +517,7 @@ function buildBalancesForGameResult(st, payload) {
   });
   return { balancesByUid: { [st.whiteUid]: w, [st.blackUid]: b }, paid: true };
 }
-/**
- * Live clock for clients — remaining ms after current turn's elapsed time.
- * Internal `st.whiteMs` / `st.blackMs` stay as banks at turn start; never send raw banks without elapsed.
- */
+
 function liveClockPayloadFromState(st) {
   const serverNow = Date.now();
   const elapsed = Math.max(0, serverNow - st.turnClockStartedAt);
@@ -322,6 +542,7 @@ function liveClockPayloadFromState(st) {
     serverNow,
   };
 }
+
 function clearDisconnectGrace(st) {
   if (st.disconnectTimeoutId) {
     clearTimeout(st.disconnectTimeoutId);
@@ -330,7 +551,7 @@ function clearDisconnectGrace(st) {
   st.disconnectingColor = null;
   st.disconnectGraceEndsAt = null;
 }
-/** Remaining reconnect window (seconds); clients show AFK banner from this. */
+
 function broadcastPlayerAfk(room, st) {
   if (!st.disconnectingColor || !st.disconnectGraceEndsAt) return;
   const sec = Math.max(0, Math.ceil((st.disconnectGraceEndsAt - Date.now()) / 1000));
@@ -339,18 +560,36 @@ function broadcastPlayerAfk(room, st) {
     remainingTime: sec,
   });
 }
+
 function destroyRoomState(room) {
   const st = roomStates.get(room);
   if (!st) return;
   clearDisconnectGrace(st);
   roomStates.delete(room);
 }
-function endMatch(room, payload) {
+
+async function endMatch(room, payload) {
   const st = roomStates.get(room);
   if (!st || st.isFinished) return;
   st.isFinished = true;
   clearDisconnectGrace(st);
-  const { balancesByUid, paid } = buildBalancesForGameResult(st, payload);
+
+  let balancesByUid;
+  let paid;
+  let alreadySettled;
+
+  if (mongoConnected()) {
+    const r = await applyGameResultToMongo(st, payload);
+    balancesByUid = r.balancesByUid;
+    paid = r.paid;
+    alreadySettled = r.alreadySettled;
+  } else {
+    const r = buildBalancesForGameResult(st, payload);
+    balancesByUid = r.balancesByUid;
+    paid = r.paid;
+    alreadySettled = r.alreadySettled;
+  }
+
   const out = {
     room,
     gameId: st.gameId,
@@ -363,11 +602,12 @@ function endMatch(room, payload) {
     blackUid: st.blackUid,
     betAmount: st.betAmount,
     mode: st.mode,
+    ...(alreadySettled ? { alreadySettled: true } : {}),
   };
   roomStates.delete(room);
   io.to(room).emit("gameResult", out);
 }
-/** Side to move ran out of time — opponent wins (blitz flag). */
+
 function finalizeTimeoutFlag(room) {
   const st = roomStates.get(room);
   if (!st || st.isFinished) return;
@@ -375,14 +615,15 @@ function finalizeTimeoutFlag(room) {
   const bank = st.toMove === "w" ? st.whiteMs : st.blackMs;
   const elapsed = Math.max(0, now - st.turnClockStartedAt);
   if (bank - elapsed > 0) return;
+
   const winnerColor = st.toMove === "w" ? "black" : "white";
-  endMatch(room, {
+  void endMatch(room, {
     reason: "timeout",
     winnerColor,
     draw: false,
-  });
+  }).catch((e) => console.error("[endMatch]", e));
 }
-/** 1 Hz: broadcast live clocks + detect flag fall (server-only time). */
+
 function tickActiveGames() {
   for (const [room, st] of [...roomStates.entries()]) {
     if (!st || st.isFinished || !roomStates.has(room)) continue;
@@ -404,6 +645,7 @@ function tickActiveGames() {
     io.to(room).emit("gameState", live);
   }
 }
+
 function startDisconnectGrace(room, disconnectedColor) {
   const st = roomStates.get(room);
   if (!st || st.isFinished) return;
@@ -418,13 +660,14 @@ function startDisconnectGrace(room, disconnectedColor) {
     const s2 = roomStates.get(room);
     if (!s2 || s2.isFinished) return;
     const winnerColor = disconnectedColor === "white" ? "black" : "white";
-    endMatch(room, {
+    void endMatch(room, {
       reason: "disconnect_forfeit",
       winnerColor,
       draw: false,
-    });
+    }).catch((e) => console.error("[endMatch]", e));
   }, GRACE_MS);
 }
+
 function createRoomState(room, gameId, mode, betAmount, whiteUid, blackUid) {
   destroyRoomState(room);
   const per = perPlayerMsForMode(mode);
@@ -449,14 +692,17 @@ function createRoomState(room, gameId, mode, betAmount, whiteUid, blackUid) {
   roomStates.set(room, st);
   return st;
 }
+
 function queueKey(mode, betAmount) {
   if (mode === "paid") return `paid_${Number(betAmount) || 0}`;
   return "free";
 }
+
 function moverCharFromMeta(meta) {
   if (!meta || (meta.color !== "white" && meta.color !== "black")) return null;
   return meta.color === "white" ? "w" : "b";
 }
+
 function handlePlayerResigned(socket, payload = {}) {
   const room = socket.matchMeta?.room;
   if (!room || socket.room !== room || !socket.matchMeta) return;
@@ -469,15 +715,17 @@ function handlePlayerResigned(socket, payload = {}) {
   if (reqPid && socket.matchMeta.playerId && reqPid !== socket.matchMeta.playerId) return;
   const loserColor = socket.matchMeta.color;
   const winnerColor = loserColor === "white" ? "black" : "white";
-  endMatch(room, {
+  void endMatch(room, {
     reason: "playerResigned",
     winnerColor,
     draw: false,
-  });
+  }).catch((e) => console.error("[endMatch]", e));
 }
+
 io.on("connection", (socket) => {
   console.log("Player connected:", socket.id);
-  socket.on("joinGame", (payload = {}) => {
+
+  socket.on("joinGame", async (payload = {}) => {
     if (payload.firestoreMatchId) {
       const rid = String(payload.firestoreMatchId)
         .replace(/[^a-zA-Z0-9_-]/g, "")
@@ -486,19 +734,32 @@ io.on("connection", (socket) => {
         socket.emit("matchmaking_error", { message: "Invalid match id." });
         return;
       }
+
       const mode = payload.mode === "paid" ? "paid" : "free";
       const betAmount =
         mode === "paid" ? Math.max(0, Math.floor(Number(payload.betAmount) || 0)) : 0;
       const uid =
         typeof payload.uid === "string" && payload.uid.length > 0 ? payload.uid : socket.id;
+
       if (mode === "paid" && betAmount <= 0) {
         socket.emit("matchmaking_error", {
           message: "Invalid stake for a money match.",
         });
         return;
       }
+
       const room = `fs_${rid}`;
+
       if (!firestoreMatchWaiters.has(rid)) {
+        if (mongoConnected()) {
+          try {
+            await getOrCreateUser(uid);
+          } catch (err) {
+            console.error("[joinGame]", err);
+            socket.emit("matchmaking_error", { message: "Server error. Try again." });
+            return;
+          }
+        }
         firestoreMatchWaiters.set(rid, { socket, uid });
         socket.join(room);
         socket.room = room;
@@ -506,17 +767,45 @@ io.on("connection", (socket) => {
         socket.emit("waiting");
         return;
       }
+
       const first = firestoreMatchWaiters.get(rid);
       firestoreMatchWaiters.delete(rid);
+
       if (!first?.socket?.connected || first.socket.id === socket.id) {
         socket.emit("matchmaking_error", {
           message: "Match room expired. Try again.",
         });
         return;
       }
+
       const gameId = crypto.randomUUID();
       const whiteUid = first.uid;
       const blackUid = uid;
+
+      if (mongoConnected()) {
+        try {
+          await getOrCreateUser(whiteUid);
+          await getOrCreateUser(blackUid);
+          if (mode === "paid" && betAmount > 0) {
+            const ok = await deductEntryFeesBoth(whiteUid, blackUid, betAmount);
+            if (!ok) {
+              first.socket.emit("matchmaking_error", {
+                message: "Insufficient wallet balance.",
+              });
+              socket.emit("matchmaking_error", {
+                message: "Insufficient wallet balance.",
+              });
+              return;
+            }
+          }
+        } catch (err) {
+          console.error("[joinGame]", err);
+          first.socket.emit("matchmaking_error", { message: "Server error. Try again." });
+          socket.emit("matchmaking_error", { message: "Server error. Try again." });
+          return;
+        }
+      }
+
       first.socket.join(room);
       socket.join(room);
       first.socket.room = room;
@@ -538,8 +827,10 @@ io.on("connection", (socket) => {
         mode,
         playerId: blackUid,
       };
+
       createRoomState(room, gameId, mode, betAmount, whiteUid, blackUid);
       const st = roomStates.get(room);
+
       const startPayload = (color) => ({
         room,
         color,
@@ -550,21 +841,25 @@ io.on("connection", (socket) => {
         blackUid,
         clock: liveClockPayloadFromState(st),
       });
+
       first.socket.emit("start", startPayload("white"));
       socket.emit("start", startPayload("black"));
       return;
     }
+
     const mode = payload.mode === "paid" ? "paid" : "free";
     const betAmount =
       mode === "paid" ? Math.max(0, Math.floor(Number(payload.betAmount) || 0)) : 0;
     const uid =
       typeof payload.uid === "string" && payload.uid.length > 0 ? payload.uid : socket.id;
+
     if (mode === "paid" && betAmount <= 0) {
       socket.emit("matchmaking_error", {
         message: "Invalid stake for a money match.",
       });
       return;
     }
+
     const guestLike =
       typeof payload.uid === "string" && payload.uid.startsWith("guest_");
     if (mode === "paid" && (!payload.uid || (payload.uid === socket.id && !guestLike))) {
@@ -573,20 +868,49 @@ io.on("connection", (socket) => {
       });
       return;
     }
+
     const key = queueKey(mode, betAmount);
     if (!waitingQueues.has(key)) {
       waitingQueues.set(key, []);
     }
     const queue = waitingQueues.get(key);
+
     const entry = { socket, uid, mode, betAmount };
+
     if (queue.length > 0) {
       const waitingPlayer = queue.shift();
       const room = `${waitingPlayer.socket.id}#${socket.id}`;
       const gameId = crypto.randomUUID();
       const whiteUid = waitingPlayer.uid;
       const blackUid = entry.uid;
+
+      if (mongoConnected()) {
+        try {
+          await getOrCreateUser(whiteUid);
+          await getOrCreateUser(blackUid);
+          if (mode === "paid" && betAmount > 0) {
+            const ok = await deductEntryFeesBoth(whiteUid, blackUid, betAmount);
+            if (!ok) {
+              waitingPlayer.socket.emit("matchmaking_error", {
+                message: "Insufficient wallet balance.",
+              });
+              socket.emit("matchmaking_error", {
+                message: "Insufficient wallet balance.",
+              });
+              return;
+            }
+          }
+        } catch (err) {
+          console.error("[joinGame]", err);
+          waitingPlayer.socket.emit("matchmaking_error", { message: "Server error. Try again." });
+          socket.emit("matchmaking_error", { message: "Server error. Try again." });
+          return;
+        }
+      }
+
       socket.join(room);
       waitingPlayer.socket.join(room);
+
       socket.room = room;
       waitingPlayer.socket.room = room;
       waitingPlayer.socket.matchMeta = {
@@ -607,6 +931,7 @@ io.on("connection", (socket) => {
       };
       createRoomState(room, gameId, mode, betAmount, whiteUid, blackUid);
       const st = roomStates.get(room);
+
       const startPayload = (color) => ({
         room,
         color,
@@ -617,14 +942,25 @@ io.on("connection", (socket) => {
         blackUid,
         clock: liveClockPayloadFromState(st),
       });
+
       waitingPlayer.socket.emit("start", startPayload("white"));
       socket.emit("start", startPayload("black"));
     } else {
+      if (mongoConnected()) {
+        try {
+          await getOrCreateUser(uid);
+        } catch (err) {
+          console.error("[joinGame]", err);
+          socket.emit("matchmaking_error", { message: "Server error. Try again." });
+          return;
+        }
+      }
       queue.push(entry);
       socket.waitingQueueKey = key;
       socket.emit("waiting");
     }
   });
+
   socket.on("rejoinMatch", (payload = {}) => {
     const room = typeof payload.room === "string" ? payload.room : "";
     const uid =
@@ -674,6 +1010,7 @@ io.on("connection", (socket) => {
     io.to(room).emit("clockSync", liveRejoin);
     io.to(room).emit("gameState", liveRejoin);
   });
+
   socket.on("appBackgrounded", (payload = {}) => {
     const room = typeof payload.room === "string" ? payload.room : "";
     const player =
@@ -690,9 +1027,9 @@ io.on("connection", (socket) => {
     if (!st || st.isFinished) {
       return;
     }
-    // Start/restart reconnect grace and AFK countdown for opponent
     startDisconnectGrace(room, player);
   });
+
   socket.on("appForegrounded", (payload = {}) => {
     const room = typeof payload.room === "string" ? payload.room : "";
     const player =
@@ -715,6 +1052,7 @@ io.on("connection", (socket) => {
       io.to(room).emit("playerReturned", { player });
     }
   });
+
   socket.on("move", (data = {}) => {
     if (!data?.move) {
       return;
@@ -725,19 +1063,23 @@ io.on("connection", (socket) => {
     if (!st || st.isFinished) return;
     const mover = moverCharFromMeta(socket.matchMeta);
     if (!mover || mover !== st.toMove) return;
+
     const now = Date.now();
     const bank = st.toMove === "w" ? st.whiteMs : st.blackMs;
     const elapsed = Math.max(0, now - st.turnClockStartedAt);
+
     if (elapsed >= bank) {
       finalizeTimeoutFlag(room);
       return;
     }
+
     const moveTry = st.chess.move({
       from: data.move.from,
       to: data.move.to,
       promotion: data.move.promotion || "q",
     });
     if (!moveTry) return;
+
     if (st.toMove === "w") {
       st.whiteMs = bank - elapsed;
     } else {
@@ -745,36 +1087,41 @@ io.on("connection", (socket) => {
     }
     st.toMove = st.toMove === "w" ? "b" : "w";
     st.turnClockStartedAt = now;
+
     io.to(room).emit("move", data.move);
     const liveAfter = liveClockPayloadFromState(st);
     io.to(room).emit("clockSync", liveAfter);
     io.to(room).emit("gameState", liveAfter);
+
     if (st.chess.isCheckmate()) {
       const loser = st.chess.turn();
       const winnerColor = loser === "w" ? "black" : "white";
-      endMatch(room, {
+      void endMatch(room, {
         reason: "checkmate",
         winnerColor,
         draw: false,
-      });
+      }).catch((e) => console.error("[endMatch]", e));
       return;
     }
     if (st.chess.isDraw()) {
-      endMatch(room, {
+      void endMatch(room, {
         reason: "draw",
         draw: true,
         winnerColor: null,
-      });
+      }).catch((e) => console.error("[endMatch]", e));
     }
   });
+
   socket.on("playerResigned", (payload) => handlePlayerResigned(socket, payload));
   socket.on("resign", (payload) => handlePlayerResigned(socket, payload));
+
   socket.on("disconnect", () => {
     console.log("Player disconnected");
     const fsKey = socket.firestoreMatchWaiterKey;
     if (fsKey && firestoreMatchWaiters.get(fsKey)?.socket === socket) {
       firestoreMatchWaiters.delete(fsKey);
     }
+
     const meta = socket.matchMeta;
     if (meta?.room && meta.color) {
       const st = roomStates.get(meta.room);
@@ -782,6 +1129,7 @@ io.on("connection", (socket) => {
         startDisconnectGrace(meta.room, meta.color);
       }
     }
+
     const key = socket.waitingQueueKey;
     if (!key) return;
     const queue = waitingQueues.get(key);
@@ -795,7 +1143,9 @@ io.on("connection", (socket) => {
     }
   });
 });
+
 setInterval(tickActiveGames, 1000);
+
 const PORT = Number(process.env.PORT) || 4000;
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Chess socket server listening on ${PORT}`);
