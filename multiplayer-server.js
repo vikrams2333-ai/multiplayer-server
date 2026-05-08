@@ -31,9 +31,6 @@ const io = new Server(server, {
 const firestoreMatchWaiters = new Map();
 /** @type {Map<string, Array<{ socket: import("socket.io").Socket, uid: string, mode: string, betAmount: number }>>} */
 const waitingQueues = new Map();
-function perPlayerMsForMode(mode) {
-  return mode === "paid" ? 5 * 60 * 1000 : 10 * 60 * 1000;
-}
 /** @type {Map<string, any>} */
 const roomStates = new Map();
 const DEFAULT_SERVER_BALANCE = 1000;
@@ -43,6 +40,9 @@ const serverBalancesByUid = new Map();
 const serverWalletLedgerByUid = new Map();
 /** Paid games that already updated the server ledger (idempotent). */
 const serverWalletSettledGameIds = new Set();
+function perPlayerMsForMode(mode) {
+  return mode === "paid" ? 5 * 60 * 1000 : 10 * 60 * 1000;
+}
 function normalizeUid(uid) {
   if (uid == null) return "";
   return String(uid).trim();
@@ -116,15 +116,11 @@ function applySrvDelta(uidRaw, deltaRaw, meta = {}) {
 }
 function parseMoneyAmount(value) {
   const n = Math.floor(Number(value));
-  if (!Number.isFinite(n) || n <= 0) {
-    return null;
-  }
+  if (!Number.isFinite(n) || n <= 0) return null;
   return n;
 }
 function isAdminRequestAuthorized(req) {
-  if (!adminApiKey) {
-    return false;
-  }
+  if (!adminApiKey) return false;
   const header = req.get("x-admin-key");
   if (header && String(header).trim() === adminApiKey) {
     return true;
@@ -332,6 +328,16 @@ function clearDisconnectGrace(st) {
     st.disconnectTimeoutId = null;
   }
   st.disconnectingColor = null;
+  st.disconnectGraceEndsAt = null;
+}
+/** Remaining reconnect window (seconds); clients show AFK banner from this. */
+function broadcastPlayerAfk(room, st) {
+  if (!st.disconnectingColor || !st.disconnectGraceEndsAt) return;
+  const sec = Math.max(0, Math.ceil((st.disconnectGraceEndsAt - Date.now()) / 1000));
+  io.to(room).emit("playerAFK", {
+    player: st.disconnectingColor,
+    remainingTime: sec,
+  });
 }
 function destroyRoomState(room) {
   const st = roomStates.get(room);
@@ -341,9 +347,7 @@ function destroyRoomState(room) {
 }
 function endMatch(room, payload) {
   const st = roomStates.get(room);
-  if (!st || st.isFinished) {
-    return;
-  }
+  if (!st || st.isFinished) return;
   st.isFinished = true;
   clearDisconnectGrace(st);
   const { balancesByUid, paid } = buildBalancesForGameResult(st, payload);
@@ -366,15 +370,11 @@ function endMatch(room, payload) {
 /** Side to move ran out of time — opponent wins (blitz flag). */
 function finalizeTimeoutFlag(room) {
   const st = roomStates.get(room);
-  if (!st || st.isFinished) {
-    return;
-  }
+  if (!st || st.isFinished) return;
   const now = Date.now();
   const bank = st.toMove === "w" ? st.whiteMs : st.blackMs;
   const elapsed = Math.max(0, now - st.turnClockStartedAt);
-  if (bank - elapsed > 0) {
-    return;
-  }
+  if (bank - elapsed > 0) return;
   const winnerColor = st.toMove === "w" ? "black" : "white";
   endMatch(room, {
     reason: "timeout",
@@ -385,9 +385,7 @@ function finalizeTimeoutFlag(room) {
 /** 1 Hz: broadcast live clocks + detect flag fall (server-only time). */
 function tickActiveGames() {
   for (const [room, st] of [...roomStates.entries()]) {
-    if (!st || st.isFinished || !roomStates.has(room)) {
-      continue;
-    }
+    if (!st || st.isFinished || !roomStates.has(room)) continue;
     const live = liveClockPayloadFromState(st);
     const w = live.whiteRemainingMs;
     const b = live.blackRemainingMs;
@@ -399,17 +397,21 @@ function tickActiveGames() {
       finalizeTimeoutFlag(room);
       continue;
     }
+    if (st.disconnectingColor) {
+      broadcastPlayerAfk(room, st);
+    }
     io.to(room).emit("clockSync", live);
     io.to(room).emit("gameState", live);
   }
 }
 function startDisconnectGrace(room, disconnectedColor) {
   const st = roomStates.get(room);
-  if (!st || st.isFinished) {
-    return;
-  }
+  if (!st || st.isFinished) return;
   clearDisconnectGrace(st);
   st.disconnectingColor = disconnectedColor;
+  const GRACE_MS = 30_000;
+  st.disconnectGraceEndsAt = Date.now() + GRACE_MS;
+  broadcastPlayerAfk(room, st);
   st.disconnectTimeoutId = setTimeout(() => {
     st.disconnectTimeoutId = null;
     if (!roomStates.has(room)) return;
@@ -421,7 +423,7 @@ function startDisconnectGrace(room, disconnectedColor) {
       winnerColor,
       draw: false,
     });
-  }, 30_000);
+  }, GRACE_MS);
 }
 function createRoomState(room, gameId, mode, betAmount, whiteUid, blackUid) {
   destroyRoomState(room);
@@ -442,46 +444,29 @@ function createRoomState(room, gameId, mode, betAmount, whiteUid, blackUid) {
     turnClockStartedAt,
     disconnectTimeoutId: null,
     disconnectingColor: null,
+    disconnectGraceEndsAt: null,
   };
   roomStates.set(room, st);
   return st;
 }
 function queueKey(mode, betAmount) {
-  if (mode === "paid") {
-    return `paid_${Number(betAmount) || 0}`;
-  }
+  if (mode === "paid") return `paid_${Number(betAmount) || 0}`;
   return "free";
 }
 function moverCharFromMeta(meta) {
-  if (!meta || (meta.color !== "white" && meta.color !== "black")) {
-    return null;
-  }
+  if (!meta || (meta.color !== "white" && meta.color !== "black")) return null;
   return meta.color === "white" ? "w" : "b";
 }
 function handlePlayerResigned(socket, payload = {}) {
   const room = socket.matchMeta?.room;
-  if (!room || socket.room !== room || !socket.matchMeta) {
-    return;
-  }
-  if (socket.matchMeta.room !== room) {
-    return;
-  }
+  if (!room || socket.room !== room || !socket.matchMeta) return;
+  if (socket.matchMeta.room !== room) return;
   const st = roomStates.get(room);
-  if (!st || st.isFinished) {
-    return;
-  }
+  if (!st || st.isFinished) return;
   const reqGid = payload.gameId != null ? String(payload.gameId) : "";
   const reqPid = payload.playerId != null ? String(payload.playerId) : "";
-  if (reqGid && reqGid !== st.gameId) {
-    return;
-  }
-  if (
-    reqPid &&
-    socket.matchMeta.playerId &&
-    reqPid !== socket.matchMeta.playerId
-  ) {
-    return;
-  }
+  if (reqGid && reqGid !== st.gameId) return;
+  if (reqPid && socket.matchMeta.playerId && reqPid !== socket.matchMeta.playerId) return;
   const loserColor = socket.matchMeta.color;
   const winnerColor = loserColor === "white" ? "black" : "white";
   endMatch(room, {
@@ -505,9 +490,7 @@ io.on("connection", (socket) => {
       const betAmount =
         mode === "paid" ? Math.max(0, Math.floor(Number(payload.betAmount) || 0)) : 0;
       const uid =
-        typeof payload.uid === "string" && payload.uid.length > 0
-          ? payload.uid
-          : socket.id;
+        typeof payload.uid === "string" && payload.uid.length > 0 ? payload.uid : socket.id;
       if (mode === "paid" && betAmount <= 0) {
         socket.emit("matchmaking_error", {
           message: "Invalid stake for a money match.",
@@ -575,9 +558,7 @@ io.on("connection", (socket) => {
     const betAmount =
       mode === "paid" ? Math.max(0, Math.floor(Number(payload.betAmount) || 0)) : 0;
     const uid =
-      typeof payload.uid === "string" && payload.uid.length > 0
-        ? payload.uid
-        : socket.id;
+      typeof payload.uid === "string" && payload.uid.length > 0 ? payload.uid : socket.id;
     if (mode === "paid" && betAmount <= 0) {
       socket.emit("matchmaking_error", {
         message: "Invalid stake for a money match.",
@@ -586,10 +567,7 @@ io.on("connection", (socket) => {
     }
     const guestLike =
       typeof payload.uid === "string" && payload.uid.startsWith("guest_");
-    if (
-      mode === "paid" &&
-      (!payload.uid || (payload.uid === socket.id && !guestLike))
-    ) {
+    if (mode === "paid" && (!payload.uid || (payload.uid === socket.id && !guestLike))) {
       socket.emit("matchmaking_error", {
         message: "Use a guest id for paid test matches.",
       });
@@ -650,9 +628,7 @@ io.on("connection", (socket) => {
   socket.on("rejoinMatch", (payload = {}) => {
     const room = typeof payload.room === "string" ? payload.room : "";
     const uid =
-      typeof payload.uid === "string" && payload.uid.length > 0
-        ? payload.uid
-        : "";
+      typeof payload.uid === "string" && payload.uid.length > 0 ? payload.uid : "";
     if (!room || !uid) {
       socket.emit("rejoinFailed", { message: "Invalid rejoin payload." });
       return;
@@ -667,6 +643,7 @@ io.on("connection", (socket) => {
       return;
     }
     const color = uid === st.whiteUid ? "white" : "black";
+    const returnedFromDisconnect = st.disconnectingColor === color;
     socket.join(room);
     socket.room = room;
     socket.matchMeta = {
@@ -678,6 +655,9 @@ io.on("connection", (socket) => {
       playerId: uid,
     };
     clearDisconnectGrace(st);
+    if (returnedFromDisconnect) {
+      io.to(room).emit("playerReturned", { player: color });
+    }
     socket.emit("rejoinOk", {
       room,
       color,
@@ -695,21 +675,13 @@ io.on("connection", (socket) => {
     io.to(room).emit("gameState", liveRejoin);
   });
   socket.on("move", (data = {}) => {
-    if (!data?.move) {
-      return;
-    }
+    if (!data?.move) return;
     const room = typeof data.room === "string" ? data.room : "";
-    if (!room || socket.room !== room || !socket.matchMeta) {
-      return;
-    }
+    if (!room || socket.room !== room || !socket.matchMeta) return;
     const st = roomStates.get(room);
-    if (!st || st.isFinished) {
-      return;
-    }
+    if (!st || st.isFinished) return;
     const mover = moverCharFromMeta(socket.matchMeta);
-    if (!mover || mover !== st.toMove) {
-      return;
-    }
+    if (!mover || mover !== st.toMove) return;
     const now = Date.now();
     const bank = st.toMove === "w" ? st.whiteMs : st.blackMs;
     const elapsed = Math.max(0, now - st.turnClockStartedAt);
@@ -722,9 +694,7 @@ io.on("connection", (socket) => {
       to: data.move.to,
       promotion: data.move.promotion || "q",
     });
-    if (!moveTry) {
-      return;
-    }
+    if (!moveTry) return;
     if (st.toMove === "w") {
       st.whiteMs = bank - elapsed;
     } else {
@@ -754,9 +724,7 @@ io.on("connection", (socket) => {
       });
     }
   });
-  socket.on("playerResigned", (payload) =>
-    handlePlayerResigned(socket, payload)
-  );
+  socket.on("playerResigned", (payload) => handlePlayerResigned(socket, payload));
   socket.on("resign", (payload) => handlePlayerResigned(socket, payload));
   socket.on("disconnect", () => {
     console.log("Player disconnected");
@@ -772,13 +740,9 @@ io.on("connection", (socket) => {
       }
     }
     const key = socket.waitingQueueKey;
-    if (!key) {
-      return;
-    }
+    if (!key) return;
     const queue = waitingQueues.get(key);
-    if (!queue) {
-      return;
-    }
+    if (!queue) return;
     const idx = queue.findIndex((e) => e.socket === socket);
     if (idx >= 0) {
       queue.splice(idx, 1);
