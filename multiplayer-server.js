@@ -287,19 +287,34 @@ io.on("connection", (socket) => {
       return;
     }
     const key = queueKey(mode, betAmount);
-    if (!waitingQueues.has(key)) waitingQueues.set(key, []);
-    const queue = waitingQueues.get(key);
-    if (queue.length === 0) {
-      queue.push({ socket, uid, mode, betAmount });
-      socket.waitingQueueKey = key;
-      socket.emit("waiting");
-      return;
-    }
-    const first = queue.shift();
-    if (!first?.socket?.connected || first.socket.id === socket.id) {
-      socket.emit("matchmaking_error", { message: "Queue entry expired. Try again." });
-      return;
-    }
+if (!waitingQueues.has(key)) waitingQueues.set(key, []);
+const queue = waitingQueues.get(key);
+// remove stale entries first
+for (let i = queue.length - 1; i >= 0; i--) {
+  const e = queue[i];
+  if (!e?.socket?.connected) queue.splice(i, 1);
+}
+// find first valid opponent (not same socket)
+let first = null;
+while (queue.length > 0) {
+  const candidate = queue.shift();
+  if (candidate?.socket?.connected && candidate.socket.id !== socket.id) {
+    first = candidate;
+    break;
+  }
+}
+// if no opponent, enqueue current player
+if (!first) {
+  queue.push({ socket, uid, mode, betAmount });
+  socket.waitingQueueKey = key;
+  socket.emit("waiting");
+  return;
+}
+// matched: clear waiting keys
+first.socket.waitingQueueKey = undefined;
+socket.waitingQueueKey = undefined;
+// ... then create room and emit "start" as you already do
+
     const room = `${first.socket.id}#${socket.id}`;
     const gameId = crypto.randomUUID();
     const whiteUid = first.uid;
