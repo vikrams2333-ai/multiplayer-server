@@ -1,7 +1,3 @@
-/**
- * Chess realtime server — run on Hostinger VPS (or any Node host).
- * MongoDB optional: connect from multiplayer-server.js (MONGODB_URI).
- */
 const express = require("express");
 const http = require("http");
 const crypto = require("crypto");
