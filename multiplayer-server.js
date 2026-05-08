@@ -1,5 +1,3 @@
-Replace your current server file with this full backend code:
-
 const express = require("express");
 const http = require("http");
 const crypto = require("crypto");
