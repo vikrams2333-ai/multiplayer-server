@@ -409,7 +409,7 @@ function startDisconnectGrace(room, disconnectedColor) {
   if (!st || st.isFinished) return;
   clearDisconnectGrace(st);
   st.disconnectingColor = disconnectedColor;
-  const GRACE_MS = 30_000;
+  const GRACE_MS = 120_000;
   st.disconnectGraceEndsAt = Date.now() + GRACE_MS;
   broadcastPlayerAfk(room, st);
   st.disconnectTimeoutId = setTimeout(() => {
