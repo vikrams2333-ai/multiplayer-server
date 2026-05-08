@@ -19,6 +19,7 @@
     "chess.js": "^1.4.0",
     "cors": "^2.8.6",
     "express": "^5.2.1",
+    "mongoose": "^8.9.0",
     "react": "19.2.3",
     "react-native": "0.84.1",
     "react-native-safe-area-context": "^5.7.0",
