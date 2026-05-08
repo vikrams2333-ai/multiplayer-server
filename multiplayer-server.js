@@ -1,13 +1,3 @@
-Use this as your full server/index.js (backend only).
-It includes:
-
-server-authoritative chess clocks
-AFK with live countdown (playerAFK)
-return handling (playerReturned)
-auto forfeit on AFK timeout (gameOver)
-timeout on chess clock (gameOver)
-compatibility events for your current frontend (clockSync, gameState, gameResult)
-single global interval (no duplicate intervals), cleanup-safe
 const express = require("express");
 const http = require("http");
 const crypto = require("crypto");
