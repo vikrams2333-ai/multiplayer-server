@@ -5,8 +5,29 @@ const { Chess } = require("chess.js");
 const { Server } = require("socket.io");
 const cors = require("cors");
 const mongoose = require("mongoose");
-const User = require("./models/User");
 const GameSettlement = require("./models/GameSettlement");
+
+const userSchema = new mongoose.Schema({
+  username: String,
+  wallet: {
+    type: Number,
+    default: 0,
+  },
+  rating: {
+    type: Number,
+    default: 1000,
+  },
+  wins: {
+    type: Number,
+    default: 0,
+  },
+  losses: {
+    type: Number,
+    default: 0,
+  },
+});
+
+const User = mongoose.model("User", userSchema);
 
 const app = express();
 const corsOrigin = process.env.CORS_ORIGIN || "*";
@@ -722,6 +743,31 @@ io.on("connection", (socket) => {
   console.log("Player connected:", socket.id);
 
   socket.on("joinGame", async (payload = {}) => {
+    const username =
+      typeof payload.uid === "string" && payload.uid.length > 0 ? payload.uid : socket.id;
+    try {
+      let user = await User.findOne({ username });
+
+      if (!user) {
+        user = await User.create({
+          username
+        });
+      }
+
+      socket.userData = user;
+
+      socket.emit("userData", {
+        wallet: user.wallet,
+        rating: user.rating,
+        wins: user.wins,
+        losses: user.losses
+      });
+    } catch (err) {
+      console.error("[joinGame] user load/create failed", err);
+      socket.emit("matchmaking_error", { message: "Server error. Try again." });
+      return;
+    }
+
     if (payload.firestoreMatchId) {
       const rid = String(payload.firestoreMatchId)
         .replace(/[^a-zA-Z0-9_-]/g, "")
