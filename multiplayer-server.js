@@ -6,6 +6,15 @@ const { Server } = require("socket.io");
 const cors = require("cors");
 const mongoose = require("mongoose");
 const GameSettlement = require("./models/GameSettlement");
+const mongoUri = (process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/chessapp").trim();
+mongoose
+  .connect(mongoUri)
+  .then(() => {
+    console.log("[mongo] connected");
+  })
+  .catch((err) => {
+    console.error("[mongo] connection failed:", err?.message || err);
+  });
 
 const userSchema = new mongoose.Schema({
   username: String,
