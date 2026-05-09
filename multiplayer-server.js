@@ -111,9 +111,10 @@ function syncServerBalancesFromSnapshot(st, balancesByUid) {
 async function getOrCreateUser(uidRaw) {
   const username = normalizeUid(uidRaw);
   if (!username) throw new Error("invalid uid");
-  let doc = await User.findOne({ username });
-  if (!doc) {
-    doc = await User.create({
+  console.log("USERNAME RECEIVED:", username);
+  let user = await User.findOne({ username });
+  if (!user) {
+    user = await User.create({
       username,
       wallet: 0,
       rating: 1000,
@@ -122,8 +123,9 @@ async function getOrCreateUser(uidRaw) {
     });
     console.log("[mongo] user created", username);
   }
-  serverBalancesByUid.set(username, Math.max(0, Math.floor(Number(doc.wallet) || 0)));
-  return doc;
+  console.log("USER SAVED/LOADED:", user);
+  serverBalancesByUid.set(username, Math.max(0, Math.floor(Number(user.wallet) || 0)));
+  return user;
 }
 
 async function updateWallet(uidRaw, delta, meta = {}) {
@@ -746,17 +748,12 @@ io.on("connection", (socket) => {
     const username =
       typeof payload.uid === "string" && payload.uid.length > 0 ? payload.uid : socket.id;
     try {
-      let user = await User.findOne({ username });
-
-      if (!user) {
-        user = await User.create({
-          username
-        });
-      }
+      const user = await getOrCreateUser(username);
 
       socket.userData = user;
 
       socket.emit("userData", {
+        username: user.username,
         wallet: user.wallet,
         rating: user.rating,
         wins: user.wins,
@@ -903,7 +900,8 @@ io.on("connection", (socket) => {
     }
 
     const guestLike =
-      typeof payload.uid === "string" && payload.uid.startsWith("guest_");
+      typeof payload.uid === "string" &&
+      (payload.uid.startsWith("guest_") || payload.uid.startsWith("Guest_"));
     if (mode === "paid" && (!payload.uid || (payload.uid === socket.id && !guestLike))) {
       socket.emit("matchmaking_error", {
         message: "Use a guest id for paid test matches.",
