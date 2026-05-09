@@ -6,15 +6,6 @@ const { Server } = require("socket.io");
 const cors = require("cors");
 const mongoose = require("mongoose");
 const GameSettlement = require("./models/GameSettlement");
-const mongoUri = (process.env.MONGODB_URI || "mongodb://127.0.0.1:27017/chessapp").trim();
-mongoose
-  .connect(mongoUri)
-  .then(() => {
-    console.log("[mongo] connected");
-  })
-  .catch((err) => {
-    console.error("[mongo] connection failed:", err?.message || err);
-  });
 
 const userSchema = new mongoose.Schema({
   username: String,
@@ -756,23 +747,34 @@ io.on("connection", (socket) => {
   socket.on("joinGame", async (payload = {}) => {
     const username =
       typeof payload.uid === "string" && payload.uid.length > 0 ? payload.uid : socket.id;
-    try {
-      const user = await getOrCreateUser(username);
+    let userData = {
+      username,
+      wallet: 0,
+      rating: 1000,
+      wins: 0,
+      losses: 0,
+    };
 
-      socket.userData = user;
-
-      socket.emit("userData", {
-        username: user.username,
-        wallet: user.wallet,
-        rating: user.rating,
-        wins: user.wins,
-        losses: user.losses
-      });
-    } catch (err) {
-      console.error("[joinGame] user load/create failed", err);
-      socket.emit("matchmaking_error", { message: "Server error. Try again." });
-      return;
+    if (mongoConnected()) {
+      try {
+        const user = await getOrCreateUser(username);
+        socket.userData = user;
+        userData = {
+          username: user.username,
+          wallet: user.wallet,
+          rating: user.rating,
+          wins: user.wins,
+          losses: user.losses,
+        };
+      } catch (err) {
+        console.error("[joinGame] user load/create failed", err);
+        socket.emit("matchmaking_error", { message: "Server error. Try again." });
+        return;
+      }
+    } else {
+      socket.userData = userData;
     }
+    socket.emit("userData", userData);
 
     if (payload.firestoreMatchId) {
       const rid = String(payload.firestoreMatchId)
