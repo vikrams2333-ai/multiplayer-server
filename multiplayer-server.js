@@ -1,3 +1,22 @@
+### FILE: index.js ###
+/**
+ * Chess realtime server — run on Hostinger VPS (or any Node host).
+ * Start from `server/`: `npm start` (uses process.env.PORT, default 4000).
+ *
+ * Env:
+ *   MONGODB_URI — optional; without it, paid wallets use in-memory fallback only.
+ *   JWT_SECRET — required for Socket.IO `auth.token` (login users); issuer `chess-bet-app`.
+ *   SOCKET_REQUIRE_JWT_FOR_PAID — set `true` to block paid queue unless socket is authenticated.
+ *   ADMIN_API_KEY — admin HTTP routes (`x-admin-key` or `Authorization: Bearer ...`).
+ *
+ * Authoritative: position (chess.js), clocks, match end, wallets via `gameResult` payloads only.
+ */
+try {
+  require("dotenv").config();
+} catch {
+  /* optional */
+}
+
 const express = require("express");
 const http = require("http");
 const crypto = require("crypto");
@@ -2257,7 +2276,12 @@ async function sendOtpSms({ phone, otp }) {
     return { provider };
   }
 
-  if (provider === "console" && env.nodeEnv !== "production") {
+  /**
+   * `SMS_PROVIDER=console` (default): log OTP and return `devOtp` for the app (no real SMS).
+   * Works in production too — fine for VPS testing. For real SMS set SMS_PROVIDER=generic
+   * and SMS_HTTP_URL / SMS_HTTP_BODY_TEMPLATE (or another provider you add here).
+   */
+  if (provider === "console") {
     console.log(`[otp] ${maskPhone(phone)} code=${otp}`);
     return { provider, devOtp: otp };
   }
